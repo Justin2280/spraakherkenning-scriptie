@@ -13,6 +13,7 @@ from src.merge.align import (
     merge_adjacent_segments,
     render_transcript,
 )
+from src.models import DiarizationTurn
 from src.transcription.engine import create_transcription_engine
 
 AUDIO_EXTENSIONS = {
@@ -50,6 +51,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip full-audio loudness normalization and only standardize format.",
     )
+    parser.add_argument(
+        "--diarization",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run speaker diarization. Use --no-diarization to transcribe only.",
+    )
+    parser.add_argument(
+        "--timestamps",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Prefix each paragraph in the transcript with its start time.",
+    )
+    parser.add_argument(
+        "--speaker-labels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Prefix each paragraph in the transcript with its speaker.",
+    )
+    parser.add_argument("--line-width", type=int, help="Wrap column for the transcript text.")
     return parser
 
 
@@ -64,33 +84,50 @@ def collect_audio_files(input_path: Path) -> list[Path]:
 def process_file(input_path: Path, config: PipelineConfig) -> tuple[Path, Path]:
     print(f"Preparing audio: {input_path}", flush=True)
     prepared = prepare_audio(input_path, config)
-    diarization_engine = PyannoteDiarizationEngine(config)
     transcription_engine = create_transcription_engine(config)
 
-    print("Running diarization...", flush=True)
-    diarization_turns = diarization_engine.diarize(prepared.normalized_path)
+    diarization_turns: list[DiarizationTurn] = []
+    if config.enable_diarization:
+        print("Running diarization...", flush=True)
+        diarization_turns = PyannoteDiarizationEngine(config).diarize(prepared.normalized_path)
+    else:
+        print("Skipping diarization (disabled).", flush=True)
     print("Running transcription...", flush=True)
     transcription_segments = transcription_engine.transcribe_chunks(
         prepared.chunks,
         prepared.chunk_dir / "transcription",
     )
-    print("Merging diarization and transcript segments...", flush=True)
+    print("Merging transcript segments...", flush=True)
     deduplicated_segments = deduplicate_overlap_segments(
         transcription_segments,
         overlap_seconds=config.chunk_overlap_seconds,
     )
-    speaker_segments = assign_speakers_to_segments(deduplicated_segments, diarization_turns)
-    merged_segments = merge_adjacent_segments(
-        sorted(speaker_segments, key=lambda item: (item.start_s, item.end_s)),
-        max_gap_s=config.merge_gap_seconds,
-    )
+    ordered_segments = sorted(deduplicated_segments, key=lambda item: (item.start_s, item.end_s))
+    if diarization_turns:
+        speaker_segments = assign_speakers_to_segments(ordered_segments, diarization_turns)
+        merged_segments = merge_adjacent_segments(
+            speaker_segments,
+            max_gap_s=config.merge_gap_seconds,
+        )
+    else:
+        # Without speakers every segment would merge into one, so leave them granular and let
+        # the renderer paragraph them by pause instead.
+        merged_segments = ordered_segments
 
     output_dir = (config.output_dir / input_path.stem).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     transcript_path = output_dir / "transcript.txt"
     json_path = output_dir / "result.json"
 
-    transcript_path.write_text(render_transcript(merged_segments), encoding="utf-8")
+    transcript_path.write_text(
+        render_transcript(
+            merged_segments,
+            include_timestamps=config.include_timestamps,
+            include_speaker_labels=config.include_speaker_labels,
+            line_width=config.transcript_line_width,
+        ),
+        encoding="utf-8",
+    )
     json_path.write_text(
         json.dumps(
             {
@@ -130,6 +167,14 @@ def main() -> int:
         overrides["chunk_overlap_seconds"] = args.chunk_overlap
     if args.skip_normalization:
         overrides["enable_global_normalization"] = False
+    if args.diarization is not None:
+        overrides["enable_diarization"] = args.diarization
+    if args.timestamps is not None:
+        overrides["include_timestamps"] = args.timestamps
+    if args.speaker_labels is not None:
+        overrides["include_speaker_labels"] = args.speaker_labels
+    if args.line_width:
+        overrides["transcript_line_width"] = args.line_width
 
     config = config.with_overrides(**overrides) if overrides else config
     files = collect_audio_files(args.input)

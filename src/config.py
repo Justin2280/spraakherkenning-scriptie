@@ -44,6 +44,7 @@ class PipelineConfig:
     min_chunk_seconds: int = 45
     max_chunk_seconds: int = 720
     preferred_split_window_seconds: int = 30
+    enable_diarization: bool = True
     expected_speakers: int = 2
     diarization_model: str = "pyannote/speaker-diarization-3.1"
     diarization_device: str = "cpu"
@@ -66,6 +67,9 @@ class PipelineConfig:
     whisper_cpp_path: str | None = None
     whisper_cpp_model_path: str | None = None
     merge_gap_seconds: float = 0.35
+    include_timestamps: bool = True
+    include_speaker_labels: bool = True
+    transcript_line_width: int = 100
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
@@ -89,6 +93,7 @@ class PipelineConfig:
             min_chunk_seconds=_get_int("MIN_CHUNK_SECONDS", 45),
             max_chunk_seconds=_get_int("MAX_CHUNK_SECONDS", 720),
             preferred_split_window_seconds=_get_int("PREFERRED_SPLIT_WINDOW_SECONDS", 30),
+            enable_diarization=_get_bool("ENABLE_DIARIZATION", True),
             expected_speakers=_get_int("EXPECTED_SPEAKERS", 2),
             diarization_model=os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1"),
             diarization_device=os.getenv("DIARIZATION_DEVICE", "cpu"),
@@ -112,6 +117,9 @@ class PipelineConfig:
             whisper_cpp_path=os.getenv("WHISPER_CPP_PATH"),
             whisper_cpp_model_path=os.getenv("WHISPER_CPP_MODEL_PATH"),
             merge_gap_seconds=_get_float("MERGE_GAP_SECONDS", 0.35),
+            include_timestamps=_get_bool("INCLUDE_TIMESTAMPS", True),
+            include_speaker_labels=_get_bool("INCLUDE_SPEAKER_LABELS", True),
+            transcript_line_width=_get_int("TRANSCRIPT_LINE_WIDTH", 100),
         )
 
     def with_overrides(self, **kwargs: object) -> "PipelineConfig":

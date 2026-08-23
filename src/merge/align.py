@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import re
+import textwrap
+from dataclasses import dataclass, replace
 
 from src.models import DiarizationTurn, TranscriptSegment
+
+# A block keeps growing until a speaker change, a long pause, or this many characters.
+# The cap stops a long monologue from rendering as one unreadable wall of text.
+MAX_BLOCK_CHARS = 700
 
 
 def deduplicate_overlap_segments(
@@ -59,15 +65,112 @@ def merge_adjacent_segments(
     return merged
 
 
-def render_transcript(segments: list[TranscriptSegment]) -> str:
-    lines: list[str] = []
+@dataclass(slots=True)
+class TranscriptBlock:
+    """One rendered paragraph: a run of segments sharing a speaker and no long pause."""
+
+    speaker: str | None
+    start_s: float
+    end_s: float
+    text: str
+
+
+def group_into_blocks(
+    segments: list[TranscriptSegment],
+    paragraph_gap_s: float = 2.0,
+) -> list[TranscriptBlock]:
+    blocks: list[TranscriptBlock] = []
     for segment in segments:
-        speaker = segment.speaker or "Onbekend"
-        lines.append(
-            f"[{format_timestamp(segment.start_s)} - {format_timestamp(segment.end_s)}] "
-            f"{speaker}: {segment.text}"
+        text = " ".join(segment.text.split())
+        if not text:
+            continue
+
+        current = blocks[-1] if blocks else None
+        if (
+            current is not None
+            and current.speaker == segment.speaker
+            and segment.start_s - current.end_s <= paragraph_gap_s
+            and len(current.text) < MAX_BLOCK_CHARS
+        ):
+            current.text = f"{current.text} {text}"
+            current.end_s = max(current.end_s, segment.end_s)
+        else:
+            blocks.append(
+                TranscriptBlock(
+                    speaker=segment.speaker,
+                    start_s=segment.start_s,
+                    end_s=segment.end_s,
+                    text=text,
+                )
+            )
+    return blocks
+
+
+def render_transcript(
+    segments: list[TranscriptSegment],
+    *,
+    include_timestamps: bool = True,
+    include_speaker_labels: bool = True,
+    line_width: int = 100,
+    paragraph_gap_s: float = 2.0,
+) -> str:
+    blocks = group_into_blocks(segments, paragraph_gap_s=paragraph_gap_s)
+    if not blocks:
+        return ""
+
+    # Without diarization no segment carries a speaker, so labels are omitted even when asked for.
+    show_speakers = include_speaker_labels and any(block.speaker for block in blocks)
+
+    paragraphs: list[str] = []
+    for block in blocks:
+        prefix = ""
+        if include_timestamps:
+            prefix += f"[{format_timestamp_short(block.start_s)}] "
+        if show_speakers:
+            prefix += f"{block.speaker or 'Onbekend'}: "
+        paragraphs.append(_wrap_block(block.text, prefix, line_width))
+    return "\n\n".join(paragraphs) + "\n"
+
+
+def _wrap_block(text: str, prefix: str, line_width: int) -> str:
+    width = max(line_width, len(prefix) + 20)
+    indent = " " * len(prefix)
+    return "\n\n".join(
+        textwrap.fill(
+            paragraph,
+            width=width,
+            initial_indent=prefix if index == 0 else indent,
+            subsequent_indent=indent,
+            break_long_words=False,
+            break_on_hyphens=False,
         )
-    return "\n".join(lines)
+        for index, paragraph in enumerate(_split_long_text(text))
+    )
+
+
+def _split_long_text(text: str) -> list[str]:
+    """Break an over-long block into paragraphs at sentence boundaries."""
+    if len(text) <= MAX_BLOCK_CHARS:
+        return [text]
+
+    paragraphs: list[str] = []
+    current = ""
+    for sentence in re.split(r"(?<=[.!?…])\s+", text):
+        if current and len(current) + len(sentence) + 1 > MAX_BLOCK_CHARS:
+            paragraphs.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        paragraphs.append(current)
+    return paragraphs
+
+
+def format_timestamp_short(seconds: float) -> str:
+    total_seconds = max(0, round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def format_timestamp(seconds: float) -> str:

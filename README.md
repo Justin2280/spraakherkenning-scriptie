@@ -44,6 +44,19 @@ Copy `.env.example` to `.env` and fill in the values you need. Important variabl
 - `CHUNK_OVERLAP_SECONDS`: overlap used to preserve sentence continuity.
 - `ENABLE_GLOBAL_NORMALIZATION`: set to `false` to compare raw vs normalized runs.
 
+Output toggles (all default to `true`):
+
+- `ENABLE_DIARIZATION`: set to `false` to transcribe only. Pyannote is then never loaded and no
+  `PYANNOTE_AUTH_TOKEN` is needed, which is also considerably faster.
+- `INCLUDE_TIMESTAMPS`: set to `false` to drop the `[HH:MM:SS]` prefix from `transcript.txt`.
+- `INCLUDE_SPEAKER_LABELS`: set to `false` to drop the `Spreker N:` prefix from `transcript.txt`.
+- `TRANSCRIPT_LINE_WIDTH`: wrap column for `transcript.txt`, default `100`.
+
+The three toggles are independent. `INCLUDE_SPEAKER_LABELS` only controls the text output: with
+diarization on and labels off, speakers are still detected, still stored in `result.json`, and
+still determine where one paragraph ends and the next begins. With diarization off there are no
+speakers at all, so labels are omitted regardless of the setting.
+
 If you later want to test `whisper.cpp`, also set:
 
 - `WHISPER_CPP_PATH`
@@ -71,13 +84,32 @@ python -m src.cli "path/to/interview.wav" --skip-normalization
 python -m src.cli "path/to/interview.wav" --backend whisper.cpp
 ```
 
+Transcription only, as plain readable prose (each CLI flag overrides the matching `.env` value):
+
+```bash
+python -m src.cli "path/to/interview.wav" --no-diarization --no-timestamps --no-speaker-labels
+```
+
 ## Output
 
 For each input file the pipeline writes:
 
-- `outputs/<stem>/transcript.txt`: human-readable speaker-labelled transcript
+- `outputs/<stem>/transcript.txt`: human-readable transcript, wrapped into paragraphs
 - `outputs/<stem>/result.json`: chunk manifest, diarization turns, and merged transcript segments
 - `work/<stem>/...`: normalized audio, chunk WAVs, and intermediate artifacts
+
+`transcript.txt` is rendered as paragraphs rather than one line per segment. A new paragraph starts
+when the speaker changes, when there is a pause longer than two seconds, or when a paragraph would
+otherwise grow past roughly 700 characters (split at a sentence boundary). Lines wrap at
+`TRANSCRIPT_LINE_WIDTH`, with continuation lines indented under the prefix:
+
+```
+[00:00:00] Spreker 1: Dus allereerst, laten we beginnen. Context en rol. Wat is jouw rol in relatie
+                      tot aanbevelingen en adviezen binnen deze organisatie?
+
+[00:00:13] Spreker 2: Ik ben een hoog financiën en controle, wat feitelijk wil zeggen dat je zo'n
+                      belangrijke adviseur bent voor de directie.
+```
 
 ## Accuracy Notes
 
