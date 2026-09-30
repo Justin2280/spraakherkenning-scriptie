@@ -24,7 +24,12 @@ AUDIO_EXTENSIONS = {
     ".mov",
     ".mp3",
     ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".mpga",
     ".ogg",
+    ".opus",
+    ".wma",
     ".wav",
     ".webm",
 }
