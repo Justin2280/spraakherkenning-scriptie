@@ -4,10 +4,29 @@ from src.merge.align import (
     merge_adjacent_segments,
     render_transcript,
 )
-from src.models import DiarizationTurn, TranscriptSegment
+from src.models import DiarizationTurn, TranscriptSegment, TranscriptWord
+
+
+def _words(*items: tuple[str, float, float]) -> list[TranscriptWord]:
+    return [TranscriptWord(text=text, start_s=start, end_s=end) for text, start, end in items]
+
+
+def _segment_from_words(words: list[TranscriptWord], **kwargs: object) -> TranscriptSegment:
+    return TranscriptSegment(
+        text=" ".join(word.text for word in words),
+        start_s=words[0].start_s,
+        end_s=words[-1].end_s,
+        words=words,
+        **kwargs,
+    )
+
+
+def _speakers_and_text(segments: list[TranscriptSegment]) -> list[tuple[str | None, str]]:
+    return [(segment.speaker, segment.text) for segment in segments]
 
 
 def test_deduplicate_overlap_segments_drops_leading_overlap_from_next_chunk() -> None:
+    # Segments without word timestamps (whisper.cpp fallback) are still dropped whole.
     segments = [
         TranscriptSegment(
             text="Welkom allemaal",
@@ -161,3 +180,136 @@ def test_render_transcript_wrapping_uses_hanging_indent_under_the_prefix() -> No
     prefix_width = len("[00:00:00] Spreker 1: ")
     assert all(line.startswith(" " * prefix_width) for line in lines[1:])
     assert all(len(line) <= 60 for line in lines)
+
+
+def test_deduplicate_keeps_the_words_of_a_segment_that_runs_past_the_chunk_boundary() -> None:
+    # Chunk 1 takes over at 607 s. Its first segment starts inside the overlap but continues for
+    # ten seconds; dropping it whole lost that speech from the transcript entirely.
+    chunk = {"chunk_index": 1, "chunk_start_s": 599.0, "chunk_end_s": 1200.0, "leading_overlap_s": 8.0}
+    straddling = _segment_from_words(
+        _words(("de", 605.0, 605.3), ("wet.", 605.3, 605.9), ("En", 608.0, 608.2), ("dan", 608.2, 608.5)),
+        **chunk,
+    )
+    after = _segment_from_words(_words(("Verder.", 610.0, 610.6)), **chunk)
+
+    cleaned = deduplicate_overlap_segments([straddling, after], overlap_seconds=8.0)
+
+    assert [segment.text for segment in cleaned] == ["En dan", "Verder."]
+    assert cleaned[0].start_s == 608.0
+
+
+def test_assign_speakers_splits_a_segment_where_the_speaker_changes() -> None:
+    # The question's last words and the answer ended up in one Whisper segment.
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=440.0, end_s=448.9),
+        DiarizationTurn(speaker="Spreker 2", start_s=449.6, end_s=470.0),
+    ]
+    segment = _segment_from_words(
+        _words(
+            ("leveren", 445.8, 446.3),
+            ("jullie", 446.3, 446.7),
+            ("voor", 446.7, 447.0),
+            ("de", 447.0, 447.1),
+            ("rekenkamers?", 447.1, 448.0),
+            ("Ja", 449.7, 450.0),
+            ("zeker.", 450.0, 450.5),
+        )
+    )
+
+    assigned = assign_speakers_to_segments([segment], turns)
+
+    assert _speakers_and_text(assigned) == [
+        ("Spreker 1", "leveren jullie voor de rekenkamers?"),
+        ("Spreker 2", "Ja zeker."),
+    ]
+    assert all(word.speaker == "Spreker 2" for word in assigned[1].words)
+
+
+def test_a_short_reply_inside_a_long_turn_gets_its_own_segment() -> None:
+    turns = [
+        DiarizationTurn(speaker="Spreker 2", start_s=0.0, end_s=5.0),
+        DiarizationTurn(speaker="Spreker 1", start_s=5.0, end_s=5.4),
+        DiarizationTurn(speaker="Spreker 2", start_s=5.4, end_s=10.0),
+    ]
+    segment = _segment_from_words(
+        _words(("dus", 4.0, 4.5), ("zo", 4.5, 4.9), ("ja,", 5.05, 5.35), ("precies.", 5.5, 6.0))
+    )
+
+    assigned = assign_speakers_to_segments([segment], turns)
+
+    assert _speakers_and_text(assigned) == [
+        ("Spreker 2", "dus zo"),
+        ("Spreker 1", "ja,"),
+        ("Spreker 2", "precies."),
+    ]
+
+
+def test_a_word_straddling_a_turn_boundary_stays_with_its_sentence() -> None:
+    # "snel." sits half in a pause; it finishes speaker 1's sentence rather than opening speaker 2's.
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=0.0, end_s=4.0),
+        DiarizationTurn(speaker="Spreker 2", start_s=4.3, end_s=8.0),
+    ]
+    segment = _segment_from_words(
+        _words(("niet", 3.0, 3.4), ("heel", 3.4, 3.8), ("snel.", 3.8, 4.5), ("De", 4.5, 4.7), ("waan", 4.7, 5.0))
+    )
+
+    assigned = assign_speakers_to_segments([segment], turns)
+
+    assert _speakers_and_text(assigned) == [("Spreker 1", "niet heel snel."), ("Spreker 2", "De waan")]
+
+
+def test_an_unclear_word_after_a_finished_sentence_joins_the_next_speaker() -> None:
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=0.0, end_s=4.0),
+        DiarizationTurn(speaker="Spreker 2", start_s=4.3, end_s=8.0),
+    ]
+    segment = _segment_from_words(_words(("klaar?", 3.0, 3.8), ("Nou", 3.9, 4.6), ("ja.", 4.6, 5.0)))
+
+    assigned = assign_speakers_to_segments([segment], turns)
+
+    assert _speakers_and_text(assigned) == [("Spreker 1", "klaar?"), ("Spreker 2", "Nou ja.")]
+
+
+def test_words_follow_speakers_across_segment_boundaries() -> None:
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=0.0, end_s=2.0),
+        DiarizationTurn(speaker="Spreker 2", start_s=2.0, end_s=6.0),
+    ]
+    first = _segment_from_words(_words(("Hoe", 0.0, 0.5), ("gaat", 0.5, 1.0), ("het?", 1.0, 1.9)))
+    second = _segment_from_words(_words(("Goed,", 2.1, 2.6), ("dank", 2.6, 3.0), ("je.", 3.0, 3.4)))
+
+    merged = merge_adjacent_segments(assign_speakers_to_segments([first, second], turns), max_gap_s=0.35)
+
+    assert _speakers_and_text(merged) == [("Spreker 1", "Hoe gaat het?"), ("Spreker 2", "Goed, dank je.")]
+
+
+def test_segment_without_words_goes_to_the_speaker_with_most_overlap() -> None:
+    # A half-second reply on the segment's midpoint used to win from 9.5 s of the other speaker.
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=0.0, end_s=4.8),
+        DiarizationTurn(speaker="Spreker 2", start_s=4.8, end_s=5.3),
+        DiarizationTurn(speaker="Spreker 1", start_s=5.3, end_s=10.0),
+    ]
+    segment = TranscriptSegment(text="lange zin", start_s=0.0, end_s=10.0)
+
+    assert assign_speakers_to_segments([segment], turns)[0].speaker == "Spreker 1"
+
+
+def test_segment_in_a_pause_goes_to_the_nearest_turn() -> None:
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=0.0, end_s=2.0),
+        DiarizationTurn(speaker="Spreker 2", start_s=10.0, end_s=12.0),
+    ]
+    segment = TranscriptSegment(text="hm", start_s=8.5, end_s=9.0)
+
+    assert assign_speakers_to_segments([segment], turns)[0].speaker == "Spreker 2"
+
+
+def test_merge_adjacent_segments_keeps_the_words() -> None:
+    first = _segment_from_words(_words(("Eerste", 0.0, 0.5)), speaker="Spreker 1")
+    second = _segment_from_words(_words(("tweede.", 0.6, 1.0)), speaker="Spreker 1")
+
+    merged = merge_adjacent_segments([first, second], max_gap_s=0.35)
+
+    assert [word.text for word in merged[0].words] == ["Eerste", "tweede."]

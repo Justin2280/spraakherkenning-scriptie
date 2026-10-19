@@ -24,6 +24,31 @@ def _get_int(name: str, default: int) -> int:
     return int(value) if value is not None else default
 
 
+def parse_speaker_count(value: str | int | None) -> int | None:
+    """Return a fixed number of speakers, or None to let diarization detect it ("auto")."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        count = value
+    else:
+        text = value.strip().lower()
+        if text in {"", "auto"}:
+            return None
+        try:
+            count = int(text)
+        except ValueError:
+            raise ValueError(f"Expected a number of speakers or 'auto', got {value!r}.") from None
+    if count < 1:
+        raise ValueError(f"The number of speakers must be at least 1, got {count}.")
+    return count
+
+
+DEFAULT_INITIAL_PROMPT = (
+    "Dit is een Nederlandstalige opname. "
+    "Behoud de transcriptie in het Nederlands, ook als er Engelstalige termen voorkomen."
+)
+
+
 @dataclass(slots=True)
 class PipelineConfig:
     ffmpeg_bin: str = "ffmpeg"
@@ -45,10 +70,15 @@ class PipelineConfig:
     max_chunk_seconds: int = 720
     preferred_split_window_seconds: int = 30
     enable_diarization: bool = True
-    expected_speakers: int = 2
-    diarization_model: str = "pyannote/speaker-diarization-3.1"
+    # None means "auto": pyannote estimates the count, optionally within min/max bounds.
+    num_speakers: int | None = None
+    min_speakers: int | None = None
+    max_speakers: int | None = None
+    diarization_model: str = "pyannote/speaker-diarization-community-1"
     diarization_device: str = "cpu"
     pyannote_auth_token: str | None = None
+    # Turns shorter than this are mostly flicker between overlapping speakers and are dropped.
+    min_turn_seconds: float = 0.2
     transcription_backend: str = "faster-whisper"
     whisper_model: str = "large-v3"
     whisper_language: str = "nl"
@@ -60,10 +90,8 @@ class PipelineConfig:
     whisper_patience: float = 1.0
     whisper_temperature: float = 0.0
     whisper_condition_on_previous_text: bool = False
-    whisper_initial_prompt: str = (
-        "Dit is een Nederlands interview met twee sprekers. "
-        "Behoud de transcriptie in het Nederlands, ook als er Engelstalige business termen voorkomen."
-    )
+    whisper_word_timestamps: bool = True
+    whisper_initial_prompt: str = DEFAULT_INITIAL_PROMPT
     whisper_cpp_path: str | None = None
     whisper_cpp_model_path: str | None = None
     merge_gap_seconds: float = 0.35
@@ -94,10 +122,14 @@ class PipelineConfig:
             max_chunk_seconds=_get_int("MAX_CHUNK_SECONDS", 720),
             preferred_split_window_seconds=_get_int("PREFERRED_SPLIT_WINDOW_SECONDS", 30),
             enable_diarization=_get_bool("ENABLE_DIARIZATION", True),
-            expected_speakers=_get_int("EXPECTED_SPEAKERS", 2),
-            diarization_model=os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1"),
+            # EXPECTED_SPEAKERS is the old name of NUM_SPEAKERS and still honoured.
+            num_speakers=parse_speaker_count(os.getenv("NUM_SPEAKERS", os.getenv("EXPECTED_SPEAKERS"))),
+            min_speakers=parse_speaker_count(os.getenv("MIN_SPEAKERS")),
+            max_speakers=parse_speaker_count(os.getenv("MAX_SPEAKERS")),
+            diarization_model=os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"),
             diarization_device=os.getenv("DIARIZATION_DEVICE", "cpu"),
             pyannote_auth_token=os.getenv("PYANNOTE_AUTH_TOKEN"),
+            min_turn_seconds=_get_float("MIN_TURN_SECONDS", 0.2),
             transcription_backend=os.getenv("TRANSCRIPTION_BACKEND", "faster-whisper"),
             whisper_model=os.getenv("WHISPER_MODEL", "large-v3"),
             whisper_language=os.getenv("WHISPER_LANGUAGE", "nl"),
@@ -109,11 +141,8 @@ class PipelineConfig:
             whisper_patience=_get_float("WHISPER_PATIENCE", 1.0),
             whisper_temperature=_get_float("WHISPER_TEMPERATURE", 0.0),
             whisper_condition_on_previous_text=_get_bool("WHISPER_CONDITION_ON_PREVIOUS_TEXT", False),
-            whisper_initial_prompt=os.getenv(
-                "WHISPER_INITIAL_PROMPT",
-                "Dit is een Nederlands interview met twee sprekers. "
-                "Behoud de transcriptie in het Nederlands, ook als er Engelstalige business termen voorkomen.",
-            ),
+            whisper_word_timestamps=_get_bool("WHISPER_WORD_TIMESTAMPS", True),
+            whisper_initial_prompt=os.getenv("WHISPER_INITIAL_PROMPT", DEFAULT_INITIAL_PROMPT),
             whisper_cpp_path=os.getenv("WHISPER_CPP_PATH"),
             whisper_cpp_model_path=os.getenv("WHISPER_CPP_MODEL_PATH"),
             merge_gap_seconds=_get_float("MERGE_GAP_SECONDS", 0.35),
@@ -124,3 +153,13 @@ class PipelineConfig:
 
     def with_overrides(self, **kwargs: object) -> "PipelineConfig":
         return replace(self, **kwargs)
+
+    def validate(self) -> None:
+        if (
+            self.min_speakers is not None
+            and self.max_speakers is not None
+            and self.min_speakers > self.max_speakers
+        ):
+            raise ValueError(
+                f"min_speakers ({self.min_speakers}) cannot be larger than max_speakers ({self.max_speakers})."
+            )
