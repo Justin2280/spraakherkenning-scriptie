@@ -41,6 +41,13 @@ class PyannoteDiarizationEngine:
             self.config.diarization_model,
             token=self.config.pyannote_auth_token,
         )
+        if pipeline is None:
+            # pyannote returns None instead of raising when the Hugging Face download is refused.
+            raise RuntimeError(
+                f"Could not load diarization model {self.config.diarization_model!r}. "
+                "Accept the model's user conditions on Hugging Face with the account that owns "
+                "PYANNOTE_AUTH_TOKEN, or set DIARIZATION_MODEL to a model you have access to."
+            )
         device = torch.device(self.config.diarization_device)
         pipeline.to(device)
         sample_rate, waveform_np = wavfile.read(str(audio_path))
@@ -54,25 +61,53 @@ class PyannoteDiarizationEngine:
 
         diarization = pipeline(
             {"waveform": waveform, "sample_rate": sample_rate},
-            num_speakers=self.config.expected_speakers,
-            min_speakers=self.config.expected_speakers,
-            max_speakers=self.config.expected_speakers,
+            **speaker_count_kwargs(self.config),
         )
 
-        speaker_map: OrderedDict[str, str] = OrderedDict()
-        turns: list[DiarizationTurn] = []
         annotation = _extract_annotation(diarization)
-        for time_range, _, raw_label in annotation.itertracks(yield_label=True):
-            if raw_label not in speaker_map:
-                speaker_map[raw_label] = f"Spreker {len(speaker_map) + 1}"
-            turns.append(
-                DiarizationTurn(
-                    speaker=speaker_map[raw_label],
-                    start_s=round(float(time_range.start), 3),
-                    end_s=round(float(time_range.end), 3),
-                )
+        raw_turns = [
+            DiarizationTurn(
+                speaker=str(raw_label),
+                start_s=round(float(time_range.start), 3),
+                end_s=round(float(time_range.end), 3),
             )
-        return _merge_adjacent_turns(turns)
+            for time_range, _, raw_label in annotation.itertracks(yield_label=True)
+        ]
+        # Filter before labelling, so a speaker that only appears in flicker gets no number.
+        turns = drop_short_turns(raw_turns, self.config.min_turn_seconds)
+        return _merge_adjacent_turns(_label_in_order_of_appearance(turns))
+
+
+def speaker_count_kwargs(config: PipelineConfig) -> dict[str, int]:
+    """Translate the speaker settings into pyannote arguments; no arguments means fully automatic."""
+    if config.num_speakers is not None:
+        return {"num_speakers": config.num_speakers}
+    bounds = {"min_speakers": config.min_speakers, "max_speakers": config.max_speakers}
+    return {name: value for name, value in bounds.items() if value is not None}
+
+
+def drop_short_turns(turns: list[DiarizationTurn], min_turn_s: float) -> list[DiarizationTurn]:
+    """Drop turns shorter than `min_turn_s`.
+
+    Where two people talk at once, pyannote's exclusive output can flip between them every few
+    tens of milliseconds. Those slivers are not real turns; words that fall in the gaps they leave
+    are assigned to the nearest remaining turn instead.
+    """
+    if min_turn_s <= 0:
+        return list(turns)
+    kept = [turn for turn in turns if turn.end_s - turn.start_s >= min_turn_s]
+    # A recording made up of nothing but tiny turns is better served unfiltered than empty.
+    return kept or list(turns)
+
+
+def _label_in_order_of_appearance(turns: list[DiarizationTurn]) -> list[DiarizationTurn]:
+    speaker_map: OrderedDict[str, str] = OrderedDict()
+    labelled: list[DiarizationTurn] = []
+    for turn in sorted(turns, key=lambda item: (item.start_s, item.end_s)):
+        if turn.speaker not in speaker_map:
+            speaker_map[turn.speaker] = f"Spreker {len(speaker_map) + 1}"
+        labelled.append(DiarizationTurn(speaker=speaker_map[turn.speaker], start_s=turn.start_s, end_s=turn.end_s))
+    return labelled
 
 
 def _merge_adjacent_turns(turns: list[DiarizationTurn], max_gap_s: float = 0.15) -> list[DiarizationTurn]:

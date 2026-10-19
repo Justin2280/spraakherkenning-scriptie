@@ -1,21 +1,22 @@
-# Dutch Two-Speaker Diarization
+# Dutch Transcription and Speaker Diarization
 
-Accuracy-first Dutch interview transcription and diarization for long files with exactly two speakers.
+Accuracy-first Dutch transcription and speaker diarization for long recordings.
 
 ## What This Pipeline Does
 
 - Normalizes the full audio file once before chunking to reduce volume-related language drift.
 - Converts audio to a consistent mono 16 kHz WAV working format.
 - Detects silences and splits long files into overlap-aware chunks.
-- Runs speaker diarization with `pyannote` constrained to two speakers.
-- Runs transcription with `Whisper large-v3` by default.
+- Runs speaker diarization with `pyannote`, with a fixed number of speakers or automatic detection.
+- Runs transcription with `Whisper large-v3` by default, with word timestamps.
+- Assigns a speaker to every word and splits the transcript wherever the speaker changes.
 - Merges chunked transcription back into one speaker-labelled transcript and JSON result.
 
 ## Runtime Design
 
 - Default ASR model: `Whisper large-v3`
 - Default transcription backend: `faster-whisper`
-- Default diarization backend: `pyannote/speaker-diarization-3.1`
+- Default diarization backend: `pyannote/speaker-diarization-community-1` (pyannote.audio 4)
 - Default runtime target on Windows + AMD: CPU-safe first
 - Optional acceleration path: `whisper.cpp` with Vulkan, while keeping `large-v3` as the target model
 
@@ -30,7 +31,8 @@ Accuracy-first Dutch interview transcription and diarization for long files with
 pip install -e .[dev]
 ```
 
-5. Request access to the Hugging Face `pyannote/speaker-diarization-3.1` model and place your token in `.env`.
+5. Accept the user conditions of the Hugging Face `pyannote/speaker-diarization-community-1` model and place
+   your token in `.env`. To keep using the older model, set `DIARIZATION_MODEL=pyannote/speaker-diarization-3.1`.
 
 ## Environment
 
@@ -43,6 +45,17 @@ Copy `.env.example` to `.env` and fill in the values you need. Important variabl
 - `TARGET_CHUNK_SECONDS`: target chunk size before overlap.
 - `CHUNK_OVERLAP_SECONDS`: overlap used to preserve sentence continuity.
 - `ENABLE_GLOBAL_NORMALIZATION`: set to `false` to compare raw vs normalized runs.
+
+Speakers:
+
+- `NUM_SPEAKERS`: the number of speakers when you know it, or `auto` (the default) to let diarization
+  decide. A known count is the more accurate choice.
+- `MIN_SPEAKERS` / `MAX_SPEAKERS`: optional bounds for `auto`.
+- `DIARIZATION_MODEL`: default `pyannote/speaker-diarization-community-1`.
+- `MIN_TURN_SECONDS`: diarization turns shorter than this are dropped, default `0.2`. Where two people talk
+  at once, pyannote can flip between them every few tens of milliseconds; those slivers are not real turns.
+- `WHISPER_WORD_TIMESTAMPS`: default `true`. Needed to assign speakers per word; with `false` each Whisper
+  segment gets a single speaker.
 
 Output toggles (all default to `true`):
 
@@ -84,6 +97,14 @@ python -m src.cli "path/to/interview.wav" --skip-normalization
 python -m src.cli "path/to/interview.wav" --backend whisper.cpp
 ```
 
+Number of speakers (each flag overrides the `.env` value):
+
+```bash
+python -m src.cli "path/to/interview.wav" --speakers 2           # you know there are two
+python -m src.cli "path/to/meeting.wav" --speakers auto          # let diarization decide
+python -m src.cli "path/to/meeting.wav" --min-speakers 3 --max-speakers 6
+```
+
 Transcription only, as plain readable prose (each CLI flag overrides the matching `.env` value):
 
 ```bash
@@ -95,7 +116,8 @@ python -m src.cli "path/to/interview.wav" --no-diarization --no-timestamps --no-
 For each input file the pipeline writes:
 
 - `outputs/<stem>/transcript.txt`: human-readable transcript, wrapped into paragraphs
-- `outputs/<stem>/result.json`: chunk manifest, diarization turns, and merged transcript segments
+- `outputs/<stem>/result.json`: settings used, detected speakers, chunk manifest, diarization turns, and merged
+  transcript segments with their words
 - `work/<stem>/...`: normalized audio, chunk WAVs, and intermediate artifacts
 
 `transcript.txt` is rendered as paragraphs rather than one line per segment. A new paragraph starts
@@ -115,8 +137,26 @@ otherwise grow past roughly 700 characters (split at a sentence boundary). Lines
 
 - Whole-file normalization is conservative by default: loudness normalization plus peak control, not heavy compression.
 - Diarization runs on the normalized full file so speaker labels stay consistent across chunked transcription.
-- Chunk overlap is used to avoid losing sentence starts/ends at boundaries.
-- The default prompt biases transcription toward Dutch while allowing English business terms inside Dutch sentences.
+- Speakers are assigned per word, not per Whisper segment. A Whisper segment often holds the end of one
+  person's sentence and the start of the other's reply; it is split where the speaker changes. A word that
+  straddles a turn boundary stays with the sentence it belongs to.
+- Chunk overlap is used to avoid losing sentence starts/ends at boundaries. The overlap is removed per word,
+  so speech in a segment that runs past the chunk boundary is kept.
+- The default prompt biases transcription toward Dutch while allowing English terms inside Dutch sentences.
+
+## Checking a Result
+
+`src.diagnose` compares a run's transcript labels with the diarization turns of the same run, without any
+manual annotation:
+
+```bash
+python -m src.diagnose outputs/<stem>/result.json
+```
+
+It reports how much speech ended up under the wrong speaker label, which turns pyannote heard but the
+transcript lost (with their text), and how much speech has no text around each chunk boundary. It cannot tell
+whether pyannote itself heard the right speaker, so listen to a few of the listed moments as well. Run it
+before and after changing a setting to see whether the change helped.
 
 ## Testing
 

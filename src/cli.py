@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from src.audio.preprocess import prepare_audio
-from src.config import PipelineConfig
+from src.config import PipelineConfig, parse_speaker_count
 from src.diarization.engine import PyannoteDiarizationEngine
 from src.merge.align import (
     assign_speakers_to_segments,
@@ -35,9 +35,24 @@ AUDIO_EXTENSIONS = {
 }
 
 
+def _speaker_count_arg(value: str) -> int | str:
+    try:
+        count = parse_speaker_count(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return "auto" if count is None else count
+
+
+def _speaker_bound_arg(value: str) -> int:
+    count = _speaker_count_arg(value)
+    if count == "auto":
+        raise argparse.ArgumentTypeError("expected a number of speakers")
+    return count
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Accuracy-first Dutch two-speaker diarization and transcription pipeline.",
+        description="Accuracy-first Dutch transcription and speaker diarization pipeline.",
     )
     parser.add_argument("input", type=Path, help="Audio file or directory to process.")
     parser.add_argument("--working-dir", type=Path, help="Intermediate work directory.")
@@ -61,6 +76,24 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Run speaker diarization. Use --no-diarization to transcribe only.",
+    )
+    parser.add_argument(
+        "--speakers",
+        type=_speaker_count_arg,
+        metavar="N|auto",
+        help="Exact number of speakers when you know it, or 'auto' to let diarization decide.",
+    )
+    parser.add_argument(
+        "--min-speakers",
+        type=_speaker_bound_arg,
+        metavar="N",
+        help="Lower bound for automatic speaker detection.",
+    )
+    parser.add_argument(
+        "--max-speakers",
+        type=_speaker_bound_arg,
+        metavar="N",
+        help="Upper bound for automatic speaker detection.",
     )
     parser.add_argument(
         "--timestamps",
@@ -93,8 +126,9 @@ def process_file(input_path: Path, config: PipelineConfig) -> tuple[Path, Path]:
 
     diarization_turns: list[DiarizationTurn] = []
     if config.enable_diarization:
-        print("Running diarization...", flush=True)
+        print(f"Running diarization (speakers: {describe_speaker_setting(config)})...", flush=True)
         diarization_turns = PyannoteDiarizationEngine(config).diarize(prepared.normalized_path)
+        print(f"Found {len(detected_speakers(diarization_turns))} speaker(s).", flush=True)
     else:
         print("Skipping diarization (disabled).", flush=True)
     print("Running transcription...", flush=True)
@@ -137,6 +171,8 @@ def process_file(input_path: Path, config: PipelineConfig) -> tuple[Path, Path]:
         json.dumps(
             {
                 "input_file": str(input_path.resolve()),
+                "settings": settings_summary(config),
+                "detected_speakers": detected_speakers(diarization_turns),
                 "prepared_audio": prepared.to_dict(),
                 "diarization_turns": [turn.to_dict() for turn in diarization_turns],
                 "segments": [segment.to_dict() for segment in merged_segments],
@@ -150,11 +186,62 @@ def process_file(input_path: Path, config: PipelineConfig) -> tuple[Path, Path]:
     return transcript_path, json_path
 
 
+def describe_speaker_setting(config: PipelineConfig) -> str:
+    if config.num_speakers is not None:
+        return str(config.num_speakers)
+    if config.min_speakers is not None and config.max_speakers is not None:
+        return f"auto, {config.min_speakers}-{config.max_speakers}"
+    if config.min_speakers is not None:
+        return f"auto, at least {config.min_speakers}"
+    if config.max_speakers is not None:
+        return f"auto, at most {config.max_speakers}"
+    return "auto"
+
+
+def detected_speakers(turns: list[DiarizationTurn]) -> list[str]:
+    return sorted({turn.speaker for turn in turns}, key=lambda label: (len(label), label))
+
+
+def settings_summary(config: PipelineConfig) -> dict[str, object]:
+    """The settings that shape the result, stored so runs can be compared afterwards."""
+    return {
+        "diarization": config.enable_diarization,
+        "diarization_model": config.diarization_model,
+        "speakers": describe_speaker_setting(config),
+        "min_turn_seconds": config.min_turn_seconds,
+        "transcription_backend": config.transcription_backend,
+        "whisper_model": config.whisper_model,
+        "whisper_compute_type": config.whisper_compute_type,
+        "word_timestamps": config.whisper_word_timestamps,
+    }
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    config = PipelineConfig.from_env()
+    try:
+        config = PipelineConfig.from_env()
+    except ValueError as exc:
+        parser.error(f"invalid setting in the environment or .env: {exc}")
+    try:
+        config = apply_cli_overrides(config, args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
+    files = collect_audio_files(args.input)
+    if not files:
+        raise FileNotFoundError(f"No audio files found at {args.input}")
+
+    for file_path in files:
+        transcript_path, json_path = process_file(file_path, config)
+        print(f"Processed {file_path}")
+        print(f"Transcript: {transcript_path}")
+        print(f"Metadata:   {json_path}")
+    return 0
+
+
+def apply_cli_overrides(config: PipelineConfig, args: argparse.Namespace) -> PipelineConfig:
+    """Layer the command-line flags over the .env settings; raises ValueError on conflicts."""
     overrides: dict[str, object] = {}
     if args.working_dir:
         overrides["working_dir"] = args.working_dir
@@ -180,18 +267,22 @@ def main() -> int:
         overrides["include_speaker_labels"] = args.speaker_labels
     if args.line_width:
         overrides["transcript_line_width"] = args.line_width
+    has_bounds = args.min_speakers is not None or args.max_speakers is not None
+    if args.speakers not in (None, "auto") and has_bounds:
+        raise ValueError("--speakers N cannot be combined with --min-speakers/--max-speakers.")
+    if args.speakers is not None:
+        overrides["num_speakers"] = None if args.speakers == "auto" else args.speakers
+    if has_bounds:
+        # Bounds only apply to automatic detection, so they override a fixed count from .env.
+        overrides["num_speakers"] = None
+        if args.min_speakers is not None:
+            overrides["min_speakers"] = args.min_speakers
+        if args.max_speakers is not None:
+            overrides["max_speakers"] = args.max_speakers
 
     config = config.with_overrides(**overrides) if overrides else config
-    files = collect_audio_files(args.input)
-    if not files:
-        raise FileNotFoundError(f"No audio files found at {args.input}")
-
-    for file_path in files:
-        transcript_path, json_path = process_file(file_path, config)
-        print(f"Processed {file_path}")
-        print(f"Transcript: {transcript_path}")
-        print(f"Metadata:   {json_path}")
-    return 0
+    config.validate()
+    return config
 
 
 if __name__ == "__main__":

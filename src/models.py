@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +46,22 @@ class DiarizationTurn:
 
 
 @dataclass(slots=True)
+class TranscriptWord:
+    text: str
+    start_s: float
+    end_s: float
+    probability: float | None = None
+    speaker: str | None = None
+
+    @property
+    def midpoint_s(self) -> float:
+        return self.start_s + max(0.0, self.end_s - self.start_s) / 2.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class TranscriptSegment:
     text: str
     start_s: float
@@ -58,6 +74,8 @@ class TranscriptSegment:
     avg_logprob: float | None = None
     no_speech_prob: float | None = None
     language: str | None = None
+    # Empty when the backend gave no word timestamps; speakers are then assigned per segment.
+    words: list[TranscriptWord] = field(default_factory=list)
 
     @property
     def midpoint_s(self) -> float:
