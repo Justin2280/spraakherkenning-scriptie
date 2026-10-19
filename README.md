@@ -140,6 +140,10 @@ otherwise grow past roughly 700 characters (split at a sentence boundary). Lines
 - Speakers are assigned per word, not per Whisper segment. A Whisper segment often holds the end of one
   person's sentence and the start of the other's reply; it is split where the speaker changes. A word that
   straddles a turn boundary stays with the sentence it belongs to.
+- When the listener says "hm" while the other person keeps talking, pyannote gives that moment to the
+  listener, but Whisper only wrote down the talker's words. Short fragments like that (at most four words,
+  1.5 s) that sit in the middle of the talker's sentence go back to the talker. Replies such as "ja, precies."
+  or "Oké, helder." are kept. A speaker change a few words away from a sentence boundary is moved to it.
 - Chunk overlap is used to avoid losing sentence starts/ends at boundaries. The overlap is removed per word,
   so speech in a segment that runs past the chunk boundary is kept.
 - The default prompt biases transcription toward Dutch while allowing English terms inside Dutch sentences.
@@ -153,10 +157,12 @@ manual annotation:
 python -m src.diagnose outputs/<stem>/result.json
 ```
 
-It reports how much speech ended up under the wrong speaker label, which turns pyannote heard but the
-transcript lost (with their text), and how much speech has no text around each chunk boundary. It cannot tell
-whether pyannote itself heard the right speaker, so listen to a few of the listed moments as well. Run it
-before and after changing a setting to see whether the change helped.
+It reports how much speech ended up under a different label than pyannote gave it, which turns pyannote heard
+but the transcript does not show (listing those of a second or longer, with their text), and how much speech
+has no text around each chunk boundary. Short turns under someone else's sentence are kept with the talker on
+purpose, so they are counted but not listed. The report cannot tell whether pyannote itself heard the right
+speaker, so listen to a few of the listed moments as well. Run it before and after changing a setting to see
+whether the change helped.
 
 ## Testing
 

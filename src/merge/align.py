@@ -18,6 +18,21 @@ UNKNOWN_SPEAKER = "Onbekend"
 CLEAR_WORD_SHARE = 0.5
 
 SENTENCE_END_RE = re.compile(r"[.!?…][\"'”’)\]]*$")
+# Any punctuation at the end of a word: a speaker change right after it is plausible.
+BREAK_RE = re.compile(r"[.!?…,;:][\"'”’)\]]*$")
+
+# Label corrections only ever move this many words, spanning at most this long.
+MAX_CORRECTION_WORDS = 4
+MAX_CORRECTION_S = 1.5
+
+# Short replies that may stand on their own in the middle of someone else's sentence.
+BACKCHANNEL_WORDS = frozenset(
+    {
+        "ja", "jaja", "nee", "precies", "klopt", "zeker", "inderdaad", "oké", "oke", "ok", "okay",
+        "hm", "hmm", "mhm", "mm", "uhu", "ah", "oh", "prima", "helder", "juist", "tuurlijk", "absoluut",
+        "yes", "yeah", "exactly", "right", "sure",
+    }
+)
 
 
 def deduplicate_overlap_segments(
@@ -281,7 +296,111 @@ def _label_words(words: list[TranscriptWord], index: _TurnIndex) -> list[str]:
             labels[position] = labels[position - 1]
         elif position + 1 < len(words):
             labels[position] = labels[position + 1]
+
+    _absorb_fragments(words, labels)
+    _snap_changes_to_sentences(words, labels)
+    _absorb_fragments(words, labels)
     return labels
+
+
+def _absorb_fragments(words: list[TranscriptWord], labels: list[str]) -> None:
+    """Give short mid-sentence fragments back to the speaker around them.
+
+    When the listener says "ja" or "hm" while the other person keeps talking, pyannote gives that
+    moment to the listener, but Whisper only wrote down the talker's words. Those words, such as
+    "en er" or "laat die", then land in the listener's turn. A short run of one speaker between
+    two runs of the other is treated as such a fragment unless it finishes a sentence or consists
+    of reply words only ("ja, precies").
+    """
+    changed = True
+    while changed:
+        changed = False
+        runs = _runs(labels)
+        candidates = []
+        for index in range(1, len(runs) - 1):
+            start, end = runs[index]
+            surrounding = labels[runs[index - 1][0]]
+            if surrounding != labels[runs[index + 1][0]]:
+                continue
+            fragment = words[start:end]
+            if (
+                _is_short(fragment)
+                and not SENTENCE_END_RE.search(fragment[-1].text)
+                and not _is_backchannel(fragment)
+            ):
+                candidates.append((_span_s(fragment), len(fragment), start, end, surrounding))
+        # Shortest fragments first: absorbing one can turn its neighbour into a regular run.
+        touched: set[int] = set()
+        for _, _, start, end, surrounding in sorted(candidates):
+            if touched & {start - 1, end}:
+                continue
+            labels[start:end] = [surrounding] * (end - start)
+            touched.update(range(start, end))
+            changed = True
+
+
+def _snap_changes_to_sentences(words: list[TranscriptWord], labels: list[str]) -> None:
+    """Move a speaker change that falls mid-sentence to a sentence boundary a few words away.
+
+    "... die hypecyclus van Gartner wel volgens | mij. Ja, zeker." becomes
+    "... wel volgens mij. | Ja, zeker." The smaller of the two possible moves wins.
+    """
+    runs = _runs(labels)
+    position = 0
+    while position < len(runs) - 1:
+        (previous_start, previous_end), (next_start, next_end) = runs[position], runs[position + 1]
+        position += 1
+        if BREAK_RE.search(words[previous_end - 1].text):
+            continue
+
+        options = []
+        last_forward = min(next_end, next_start + MAX_CORRECTION_WORDS)
+        sentence_end = next(
+            (index for index in range(next_start, last_forward) if SENTENCE_END_RE.search(words[index].text)),
+            None,
+        )
+        if sentence_end is not None:
+            options.append((sentence_end + 1 - next_start, 0, next_start, sentence_end + 1, labels[previous_start]))
+        first_backward = max(previous_start, previous_end - 1 - MAX_CORRECTION_WORDS)
+        sentence_end = next(
+            (
+                index
+                for index in range(previous_end - 2, first_backward - 1, -1)
+                if SENTENCE_END_RE.search(words[index].text)
+            ),
+            None,
+        )
+        if sentence_end is not None:
+            options.append((previous_end - sentence_end - 1, 1, sentence_end + 1, previous_end, labels[next_start]))
+
+        for _, _, start, end, speaker in sorted(options):
+            moved = words[start:end]
+            if _is_short(moved) and not _is_backchannel(moved):
+                labels[start:end] = [speaker] * (end - start)
+                runs = _runs(labels)
+                break
+
+
+def _runs(labels: list[str]) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start = 0
+    for position in range(1, len(labels) + 1):
+        if position == len(labels) or labels[position] != labels[start]:
+            runs.append((start, position))
+            start = position
+    return runs
+
+
+def _is_short(words: list[TranscriptWord]) -> bool:
+    return len(words) <= MAX_CORRECTION_WORDS and _span_s(words) <= MAX_CORRECTION_S
+
+
+def _span_s(words: list[TranscriptWord]) -> float:
+    return words[-1].end_s - words[0].start_s
+
+
+def _is_backchannel(words: list[TranscriptWord]) -> bool:
+    return all(re.sub(r"[^\w'-]", "", word.text.lower()) in BACKCHANNEL_WORDS for word in words)
 
 
 def _split_on_speaker_change(

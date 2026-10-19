@@ -17,6 +17,9 @@ from typing import Any
 
 # Turns shorter than this are reported as flicker rather than as real turns.
 SHORT_TURN_S = 0.25
+# Lost turns shorter than this are mostly a listener's "hm" under the talker's words, which the
+# merge step gives back to the talker on purpose; only longer ones are listed.
+LISTEN_TURN_S = 1.0
 # Half-width of the window around each chunk boundary that is checked for missing text.
 BOUNDARY_WINDOW_S = 12.0
 
@@ -96,8 +99,14 @@ def format_report(report: dict[str, Any]) -> str:
     )
 
     lost = report["lost_turns"]
+    longer = [item for item in lost if item["end_s"] - item["start_s"] >= LISTEN_TURN_S]
     lines.append(f"Turns of {SHORT_TURN_S} s or longer that ended up under another speaker: {len(lost)}")
-    for item in lost:
+    lines.append(
+        f"  shorter than {LISTEN_TURN_S:.0f} s: {len(lost) - len(longer)} "
+        "(mostly a listener's 'hm' under the talker's words, kept with the talker on purpose)"
+    )
+    lines.append(f"  {LISTEN_TURN_S:.0f} s or longer, worth listening to: {len(longer)}")
+    for item in longer:
         lines.append(
             f"  {_clock(item['start_s'])} {item['speaker']} ({item['end_s'] - item['start_s']:.1f} s), "
             f"labelled {item['transcript_speaker']}: {item['text']}"
@@ -147,7 +156,7 @@ def _text_during(turn: dict[str, Any], segments: list[dict[str, Any]], limit: in
         else:
             # Leave room for the "≈…" and "…" markers within the limit.
             pieces.append(_approximate_excerpt(segment, turn, limit - 4))
-    text = " ".join(pieces)
+    text = " ".join(pieces) or "(no words in this turn)"
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 

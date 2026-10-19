@@ -313,3 +313,145 @@ def test_merge_adjacent_segments_keeps_the_words() -> None:
     merged = merge_adjacent_segments([first, second], max_gap_s=0.35)
 
     assert [word.text for word in merged[0].words] == ["Eerste", "tweede."]
+
+
+def test_words_in_the_listeners_short_turn_stay_with_the_talker() -> None:
+    # The listener's "hm" while the talker keeps going gets its own turn, but Whisper only wrote
+    # down the talker's words; "en er" must not be handed to the listener.
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=0.0, end_s=4.25),
+        DiarizationTurn(speaker="Spreker 2", start_s=4.25, end_s=4.86),
+        DiarizationTurn(speaker="Spreker 1", start_s=5.24, end_s=10.0),
+    ]
+    segment = _segment_from_words(
+        _words(
+            ("er", 1.6, 2.2),
+            ("wordt", 2.2, 2.4),
+            ("veel", 2.4, 2.8),
+            ("gemaakt", 2.8, 4.0),
+            ("en", 4.0, 4.54),
+            ("er", 4.54, 5.4),
+            ("wordt", 5.4, 6.6),
+            ("meer", 6.6, 7.0),
+            ("gedeeld.", 7.0, 7.9),
+        )
+    )
+
+    assigned = assign_speakers_to_segments([segment], turns)
+
+    assert _speakers_and_text(assigned) == [("Spreker 1", "er wordt veel gemaakt en er wordt meer gedeeld.")]
+
+
+def test_a_short_reply_in_the_middle_of_a_sentence_is_kept() -> None:
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=0.0, end_s=4.3),
+        DiarizationTurn(speaker="Spreker 2", start_s=4.4, end_s=5.8),
+        DiarizationTurn(speaker="Spreker 1", start_s=6.0, end_s=9.0),
+    ]
+    segment = _segment_from_words(
+        _words(
+            ("Wie", 3.6, 3.9),
+            ("weet,", 3.9, 4.2),
+            ("ja", 4.5, 4.7),
+            ("precies.", 4.7, 5.6),
+            ("Nou", 6.1, 6.5),
+            ("ja.", 6.5, 6.8),
+        )
+    )
+
+    assigned = assign_speakers_to_segments([segment], turns)
+
+    assert _speakers_and_text(assigned) == [
+        ("Spreker 1", "Wie weet,"),
+        ("Spreker 2", "ja precies."),
+        ("Spreker 1", "Nou ja."),
+    ]
+
+
+def test_a_bare_reply_word_without_punctuation_is_kept() -> None:
+    turns = [
+        DiarizationTurn(speaker="Spreker 2", start_s=0.0, end_s=3.0),
+        DiarizationTurn(speaker="Spreker 1", start_s=3.0, end_s=3.4),
+        DiarizationTurn(speaker="Spreker 2", start_s=3.4, end_s=8.0),
+    ]
+    segment = _segment_from_words(
+        _words(("principe.", 2.0, 2.9), ("Ja,", 3.05, 3.35), ("dat", 3.5, 3.7), ("klopt", 3.7, 4.0), ("wel.", 4.0, 4.3))
+    )
+
+    assigned = assign_speakers_to_segments([segment], turns)
+
+    assert [speaker for speaker, _ in _speakers_and_text(assigned)] == ["Spreker 2", "Spreker 1", "Spreker 2"]
+
+
+def test_a_change_just_before_the_end_of_a_sentence_moves_to_that_end() -> None:
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=0.0, end_s=7.6),
+        DiarizationTurn(speaker="Spreker 2", start_s=7.6, end_s=9.0),
+    ]
+    segment = _segment_from_words(
+        _words(
+            ("je", 5.0, 5.5),
+            ("kent", 5.5, 5.8),
+            ("die", 5.8, 6.0),
+            ("cyclus", 6.0, 6.6),
+            ("wel", 6.6, 7.0),
+            ("volgens", 7.0, 7.55),
+            ("mij.", 7.58, 7.72),
+            ("Ja,", 7.78, 8.14),
+            ("zeker.", 8.14, 8.4),
+        )
+    )
+
+    assigned = assign_speakers_to_segments([segment], turns)
+
+    assert _speakers_and_text(assigned) == [
+        ("Spreker 1", "je kent die cyclus wel volgens mij."),
+        ("Spreker 2", "Ja, zeker."),
+    ]
+
+
+def test_a_sentence_start_left_with_the_previous_speaker_moves_on() -> None:
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=0.0, end_s=2.0),
+        DiarizationTurn(speaker="Spreker 2", start_s=2.0, end_s=5.0),
+    ]
+    segment = _segment_from_words(
+        _words(
+            ("Ja,", 0.5, 0.8),
+            ("klopt.", 0.8, 1.3),
+            ("Niet", 1.4, 1.9),
+            ("op", 2.1, 2.3),
+            ("de", 2.3, 2.4),
+            ("hype", 2.4, 2.8),
+            ("meegaan.", 2.8, 3.5),
+        )
+    )
+
+    assigned = assign_speakers_to_segments([segment], turns)
+
+    assert _speakers_and_text(assigned) == [("Spreker 1", "Ja, klopt."), ("Spreker 2", "Niet op de hype meegaan.")]
+
+
+def test_a_longer_interruption_is_not_treated_as_a_fragment() -> None:
+    turns = [
+        DiarizationTurn(speaker="Spreker 1", start_s=0.0, end_s=2.0),
+        DiarizationTurn(speaker="Spreker 2", start_s=2.0, end_s=4.5),
+        DiarizationTurn(speaker="Spreker 1", start_s=4.5, end_s=7.0),
+    ]
+    segment = _segment_from_words(
+        _words(
+            ("en", 1.0, 1.5),
+            ("toen", 1.5, 1.9),
+            ("maar", 2.1, 2.4),
+            ("dat", 2.4, 2.6),
+            ("was", 2.6, 2.9),
+            ("toch", 2.9, 3.4),
+            ("anders", 3.4, 4.3),
+            ("zei", 4.6, 5.0),
+            ("hij", 5.0, 5.3),
+        )
+    )
+
+    assigned = assign_speakers_to_segments([segment], turns)
+
+    assert [speaker for speaker, _ in _speakers_and_text(assigned)] == ["Spreker 1", "Spreker 2", "Spreker 1"]
