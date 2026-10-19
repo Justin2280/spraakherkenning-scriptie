@@ -101,7 +101,9 @@ class PipelineConfig:
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
-        load_dotenv(override=False)
+        # utf-8-sig tolerates a BOM (Windows editors often add one), which would
+        # otherwise corrupt the first key in .env.
+        load_dotenv(override=False, encoding="utf-8-sig")
         return cls(
             ffmpeg_bin=os.getenv("FFMPEG_BIN", "ffmpeg"),
             ffprobe_bin=os.getenv("FFPROBE_BIN", "ffprobe"),
